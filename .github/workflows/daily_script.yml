@@ -1,0 +1,32 @@
+name: Daily 2020 Vision Radio Script Automation
+
+on:
+  schedule:
+    # Runs Monday through Friday at 22:00 UTC (6:00 PM AST)
+    - cron: '0 22 * * 1-5'
+  workflow_dispatch: # Allows manual testing
+
+jobs:
+  build-and-send:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install google-genai python-docx
+
+      - name: Run Radio Automation Script
+        env:
+          GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
+          SENDER_EMAIL: ${{ secrets.SENDER_EMAIL }}
+          SENDER_PASSWORD: ${{ secrets.SENDER_PASSWORD }}
+          PRESENTER_EMAIL: ${{ secrets.PRESENTER_EMAIL }}
+        run: python radio_automation.py
