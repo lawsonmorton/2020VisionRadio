@@ -83,7 +83,7 @@ try:
       f"Calling Gemini API with web search grounding for date: {date_str}..."
   )
   response = client.models.generate_content(
-      model="gemini-2.5-flash",
+      model="gemini-2.0-flash",
       contents=system_prompt,
       config=types.GenerateContentConfig(
           tools=[{"google_search": {}}],
