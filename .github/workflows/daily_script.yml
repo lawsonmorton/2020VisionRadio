@@ -2,8 +2,8 @@ name: Daily 2020 Vision Radio Script Automation
 
 on:
   schedule:
-    # Runs Monday through Friday at 22:00 UTC (6:00 PM AST)
-    - cron: '0 22 * * 1-5'
+    # Runs Sunday through Thursday at 20:00 UTC (4:00 PM AST)
+    - cron: '0 20 * * 0-4'
   workflow_dispatch: # Allows manual testing from the Actions tab
 
 jobs:
