@@ -10,10 +10,12 @@ only make news up. Links were only checked for "does the page load", never
 "is this the right story", and no story had a date.
 
 New: Python collects real, dated news items from RSS feeds (direct outlet feeds
-plus Google News searches per island). Only items from the last NEWS_MAX_AGE_HOURS
-are kept. The AI only REWRITES those items into easy-to-read radio copy. The
-dates and links are attached by the code from the feed data, so the AI cannot
-invent a story, a date or a URL.
+plus Google News searches per island), keeps only items from the last
+NEWS_MAX_AGE_HOURS, then downloads each full article. The AI writes a finished,
+flowing on-air news item from that article text only. Source links, audio/video
+links and dates are attached by the code from the real data, so the AI cannot
+invent a story, a date or a URL. Each story gets a footnote: source link with the
+publication date in [brackets].
 
 Run normally:          python radio_automation.py
 Test your news feeds:  python radio_automation.py --check-feeds
@@ -65,6 +67,7 @@ EXTRA_FEEDS = os.environ.get("EXTRA_FEEDS", "").strip()
 
 NEWS_MAX_AGE_HOURS = int(os.environ.get("NEWS_MAX_AGE_HOURS", "48"))
 USE_GOOGLE_NEWS = os.environ.get("USE_GOOGLE_NEWS", "1") != "0"
+ARTICLE_CHARS = int(os.environ.get("ARTICLE_CHARS", "6000"))  # article text given to the AI per story
 
 OPENAI_MODEL = os.environ.get("OPENAI_MODEL", "gpt-4o")
 ANTHROPIC_MODELS = [
@@ -227,6 +230,21 @@ def _small_run(paragraph, text):
     return r
 
 
+def render_footnote(doc, text):
+    """Small grey source footnote with clickable links; the [date] sits next to the link."""
+    p = doc.add_paragraph()
+    p.paragraph_format.line_spacing = 1.0
+    p.paragraph_format.space_after = Pt(14)
+    last = 0
+    for m in URL_PATTERN.finditer(text):
+        if m.start() > last:
+            _small_run(p, text[last:m.start()])
+        add_hyperlink(p, m.group(0), m.group(0))
+        last = m.end()
+    if last < len(text):
+        _small_run(p, text[last:])
+
+
 def render_line(doc, line):
     """
     Renders one script line.
@@ -235,6 +253,14 @@ def render_line(doc, line):
     """
     s = line.rstrip()
     if not s.strip():
+        return
+    if s.startswith("^ "):
+        render_footnote(doc, s[2:])
+        return
+    if s.strip() == "###":
+        p = doc.add_paragraph()
+        p.alignment = WD_ALIGN_PARAGRAPH.CENTER
+        p.add_run("###").bold = True
         return
     if s.startswith("==="):
         p = doc.add_paragraph()
@@ -677,52 +703,194 @@ def spoken_date(dt_utc):
     return f"{local.strftime('%A, %B')} {local.day}"
 
 
+def footnote_date(dt_utc):
+    local = dt_utc.astimezone(AST)
+    return f"{local.strftime('%A, %B')} {local.day}, {local.year}"
+
+
+def clean_link(url):
+    return (url or "").replace("]", "%5D").replace("|", "%7C")
+
+
+# ---- Full article text (so stories can be written in full, from facts only) ----
+def resolve_google_link(url):
+    """Google News links are redirects; decode them to the real article address."""
+    if "news.google.com" not in url:
+        return url
+    try:
+        from googlenewsdecoder import gnewsdecoder
+
+        r = gnewsdecoder(url)
+        if r.get("status") and r.get("decoded_url"):
+            return r["decoded_url"]
+    except Exception as err:
+        print(f"  could not decode Google link: {str(err)[:80]}")
+    return url
+
+
+def extract_article_text(page_html):
+    text = ""
+    try:
+        import trafilatura
+
+        text = trafilatura.extract(page_html, include_comments=False, include_tables=False,
+                                   favor_precision=True) or ""
+    except Exception:
+        pass
+    if len(text) < 300:  # fallback: collect the page's longer paragraphs
+        paras = [clean_html(p) for p in re.findall(r"<p[^>]*>(.*?)</p>", page_html, flags=re.S | re.I)]
+        text = "\n".join(p for p in paras if len(p) > 60)
+    return text[:ARTICLE_CHARS]
+
+
+def media_from_html(page_html):
+    """Audio/video embedded inside the article itself (never from sidebars)."""
+    m = re.search(r"<article.*?</article>", page_html, flags=re.S | re.I)
+    if not m:
+        return None, None
+    body = m.group(0)
+    video = audio = None
+    y = re.search(r"youtube(?:-nocookie)?\.com/embed/([\w-]{11})", body)
+    if y:
+        video = f"https://www.youtube.com/watch?v={y.group(1)}"
+    else:
+        v = re.search(r"https?://[^\s\"'<>]+\.(?:mp4|m4v|webm)", body)
+        video = v.group(0) if v else None
+    a_ = re.search(r"https?://[^\s\"'<>]+\.(?:mp3|m4a|aac)", body)
+    audio = a_.group(0) if a_ else None
+    return audio, video
+
+
+def fetch_article(it):
+    it["link"] = clean_link(resolve_google_link(it["link"]))
+    it["article"] = ""
+    if "news.google.com" in it["link"]:
+        return  # could not decode: we only have the headline/summary for this one
+    try:
+        r = requests.get(it["link"], headers=UA, timeout=15)
+        r.raise_for_status()
+        it["article"] = extract_article_text(r.text)
+        audio, video = media_from_html(r.text)
+        it["audio"] = it["audio"] or (clean_link(audio) if audio else None)
+        it["video"] = it["video"] or (clean_link(video) if video else None)
+    except Exception as err:
+        print(f"  could not read article {it['link'][:70]}: {str(err)[:60]}")
+
+
+def enrich_articles(selected):
+    with concurrent.futures.ThreadPoolExecutor(max_workers=8) as pool:
+        list(pool.map(fetch_article, selected))
+
+
+# ---- Writing the broadcast copy ----
 def clean_ai_text(text):
-    text = re.sub(r"https?://\S+", "", text or "")
-    return re.sub(r"\s+", " ", text.replace("[", "(").replace("]", ")")).strip()
+    """Strips URLs and brackets but keeps paragraph breaks."""
+    out = []
+    for para in re.split(r"\n\s*\n", text or ""):
+        para = re.sub(r"https?://\S+", "", para).replace("[", "(").replace("]", ")")
+        para = re.sub(r"\s+", " ", para).strip()
+        if para:
+            out.append(para)
+    return "\n".join(out)
+
+
+def word_count(text):
+    return len(re.findall(r"\b[\w'’-]+\b", text))
+
+
+def trt(words):
+    secs = int(round(words / 2.5))  # about 150 words per minute
+    return f"{secs // 60}:{secs % 60:02d}"
+
+
+MONTHS_DAYS = set("""monday tuesday wednesday thursday friday saturday sunday january february march
+april may june july august september october november december""".split())
+
+
+def unverified_terms(script, source_text, allow):
+    """Capitalised names/terms in the script that do not appear in the source article."""
+    src = source_text.lower()
+    flagged = []
+    for sent in re.split(r"(?<=[.!?])\s+", script.replace("\n", " ")):
+        words = re.findall(r"[A-Za-z][A-Za-z'’\-]*", sent)
+        for w in words[1:]:
+            lw = w.lower()
+            if w[0].isupper() and len(w) >= 4 and lw not in MONTHS_DAYS and lw not in allow:
+                if lw not in src and lw.rstrip("s") not in src:
+                    flagged.append(w)
+    return sorted(set(flagged))[:8]
 
 
 def write_news_copy(selected):
-    """AI rewrites the REAL items as radio copy. Returns ({id: {headline, script}}, provider)."""
-    payload = [{
-        "id": i["id"], "island": T_BY_KEY[i["territory"]][1], "outlet": i["outlet"],
-        "published": spoken_date(i["published"]), "headline": i["title"],
-        "details": i["summary"],
-    } for i in selected]
-    prompt = (
-        "You are a Caribbean radio news writer for 2020 Vision Radio 102.1 FM in St. Kitts and "
-        "Nevis. Below are real news items, already collected and dated. Rewrite EACH item as a "
-        "short, clear paragraph a newscaster can read aloud without stumbling.\n\n"
-        "RULES:\n"
-        "- Use ONLY facts in the item's headline and details. Do NOT add names, numbers, quotes, "
-        "places, causes or background that are not given. If details are thin, write one or two "
-        "plain sentences.\n"
-        "- 2 to 4 short sentences, about 35 to 70 words. Spoken style, active voice, no jargon.\n"
-        "- Start by crediting the outlet and the day, e.g. 'According to SKNIS on Tuesday...'. "
-        "Use the 'published' day given; do not change it.\n"
-        "- Write numbers and abbreviations the way they are spoken (e.g. 'five thousand dollars', "
-        "'Prime Minister', not 'PM').\n"
-        "- No URLs, no square brackets, no stage directions.\n"
-        "- Also give a short headline of at most 10 words.\n\n"
-        "Return ONLY JSON: {\"items\": [{\"id\": \"N1\", \"headline\": \"...\", \"script\": \"...\"}]}\n\n"
-        f"ITEMS:\n{json.dumps(payload, ensure_ascii=False, indent=1)}"
-    )
-    result = generate(prompt, json_mode=True)
-    if not result:
-        return {}, None
-    try:
-        data = parse_json_block(result["text"])
-        out = {}
-        for row in data.get("items", []):
-            if row.get("id") in {i["id"] for i in selected} and row.get("script"):
-                out[row["id"]] = {
-                    "headline": clean_ai_text(row.get("headline", "")),
-                    "script": clean_ai_text(row["script"]),
-                }
-        return out, result["provider"]
-    except Exception as err:
-        print(f"Could not parse news copy JSON: {err}")
-        return {}, None
+    """
+    AI writes finished on-air news items from the REAL article text.
+    Returns ({id: {headline, script, full}}, providers).
+    """
+    copy, providers = {}, []
+    for start in range(0, len(selected), 5):
+        batch = selected[start:start + 5]
+        payload = []
+        for i in batch:
+            full = len(i.get("article", "")) >= 400
+            local = i["territory"] in ("stkitts", "nevis")
+            payload.append({
+                "id": i["id"], "island": T_BY_KEY[i["territory"]][1], "outlet": i["outlet"],
+                "published_day": spoken_date(i["published"]), "headline": i["title"],
+                "source_text": i["article"] if full else (i["summary"] or "(headline only)"),
+                "full_article_available": full,
+                "target_words": ("110 to 190" if local else "70 to 130") if full else "35 to 55",
+            })
+        prompt = (
+            "You are the senior news writer at 2020 Vision Radio 102.1 FM in St. Kitts and Nevis. "
+            "Write each story below as a FINISHED, broadcast-ready news item that the newscaster "
+            "will read on air exactly as written, with no editing.\n\n"
+            "ACCURACY (most important):\n"
+            "- Use ONLY facts found in that story's source_text and headline. Never add names, "
+            "titles, numbers, dates, places, causes, background or quotes that are not there. "
+            "Do not guess. If the source says 'alleged', 'police say' or 'reportedly', keep that "
+            "wording.\n"
+            "- If full_article_available is false you only have a headline or short summary: write "
+            "a brief item of the target length from those facts alone.\n\n"
+            "STYLE (write for the ear, in professional broadcast style):\n"
+            "- Lead with the most important news in the first sentence, then the key details, then "
+            "any context or what happens next. The item must flow naturally from start to end as "
+            "one continuous piece, not a list of facts or a summary.\n"
+            "- Short, clear, conversational sentences (usually under 20 words). Active voice. "
+            "Use short paragraphs of two to four sentences.\n"
+            "- Give the attribution naturally in the first or second sentence, e.g. 'the St. Kitts "
+            "and Nevis Information Service says'. Refer to the day using published_day (for example "
+            "'on Thursday'). Never say 'yesterday', 'today' or 'tonight'.\n"
+            "- For any island other than St. Kitts or Nevis, name the island in the first sentence.\n"
+            "- Do not use direct quotations; report what was said in your own words and name who "
+            "said it.\n"
+            "- Spell out numbers, money and abbreviations the way they are spoken ('five thousand "
+            "dollars', 'Prime Minister', 'percent'). Write names exactly as in the source.\n"
+            "- No URLs, square brackets, parentheses, bullet points, stage directions or sign-offs. "
+            "Do not address the newscaster. Do not end with a teaser.\n"
+            "- Aim for the item's target_words.\n"
+            "- Also write a short headline slug of at most 8 words in capital letters.\n\n"
+            "Return ONLY JSON: {\"items\": [{\"id\": \"N1\", \"headline\": \"...\", "
+            "\"script\": \"paragraph one\\n\\nparagraph two\"}]}\n\n"
+            f"STORIES:\n{json.dumps(payload, ensure_ascii=False, indent=1)}"
+        )
+        result = generate(prompt, json_mode=True, max_tokens=8000)
+        if not result:
+            continue
+        try:
+            data = parse_json_block(result["text"])
+            ids = {i["id"]: i for i in batch}
+            for row in data.get("items", []):
+                it = ids.get(row.get("id"))
+                if it and row.get("script"):
+                    copy[it["id"]] = {
+                        "headline": clean_ai_text(row.get("headline", "")).upper() or it["title"].upper(),
+                        "script": clean_ai_text(row["script"]),
+                        "full": len(it.get("article", "")) >= 400,
+                    }
+            providers.append(result["provider"])
+        except Exception as err:
+            print(f"Could not parse news copy JSON: {err}")
+    return copy, providers
 
 
 def write_weather_sports(date_str, friday_next):
@@ -795,17 +963,16 @@ def check_feeds():
 
 
 # --- 9. MAIN --------------------------------------------------------------------------
-def source_line(it, link_ok):
-    parts = [f"Source: {it['outlet']}",
-             f"Published: {it['published'].astimezone(AST).strftime('%a %b %d, %Y %I:%M %p').replace(' 0', ' ')} AST",
-             f"Article: {it['link']}"]
+def footnote_line(it, link_ok):
+    """Footnote under each story: source link with the story's date in brackets."""
+    text = f"^ Source: {it['outlet']}: {it['link']} [{footnote_date(it['published'])}]"
     if it["audio"]:
-        parts.append(f"Audio: {it['audio']}")
+        text += f"   Audio: {it['audio']}"
     if it["video"]:
-        parts.append(f"Video: {it['video']}")
+        text += f"   Video: {it['video']}"
     if not link_ok.get(it["link"], True):
-        parts.append("LINK COULD NOT BE CHECKED - verify before airing")
-    return "[" + " | ".join(parts) + "]"
+        text += "   (link not confirmed - verify before airing)"
+    return text
 
 
 def main():
@@ -823,39 +990,84 @@ def main():
     print("Collecting news...")
     seen = load_seen()
     selected, report = gather_news(seen)
-    print(f"Selected {len(selected)} news items.")
+    print(f"Selected {len(selected)} news items. Reading full articles...")
+    enrich_articles(selected)
     link_ok = check_links(selected) if selected else {}
     bad_links = [u for u, ok in link_ok.items() if not ok]
 
-    copy, news_provider = ({}, None)
+    copy, providers = ({}, [])
     if selected:
-        copy, news_provider = write_news_copy(selected)
-        if not copy:
-            notes.append("AI news rewrite FAILED - news below is the raw headline and summary, "
-                         "UNEDITED. Read through before airing.")
-
-    lines = ["=== SCRIPT 1: NEWS SEGMENT ===", "[station intro sting]",
-             f"Good morning, and welcome to the news on 2020 Vision Radio, one-oh-two point one FM. "
-             f"Here are the latest headlines for {tomorrow.strftime('%A, %B')} {tomorrow.day}.",
-             "[pause]"]
-    for key, label, _g, _m, _k, _q in TERRITORIES:
-        group = [i for i in selected if i["territory"] == key]
-        if not group:
+        print("Writing news items...")
+        copy, providers = write_news_copy(selected)
+    missing = [i for i in selected if i["id"] not in copy]
+    if missing:
+        notes.append(f"{len(missing)} story(ies) could NOT be written by the AI and appear as the "
+                     "raw headline and summary. Edit before airing: "
+                     + "; ".join(i["title"] for i in missing))
+    short = [i for i in selected if i["id"] in copy and not copy[i["id"]]["full"]]
+    if short:
+        notes.append("Short items (the full article could not be read, so only the headline/summary "
+                     "was available): " + "; ".join(f"{i['title']} ({i['outlet']})" for i in short))
+    for i in selected:
+        c = copy.get(i["id"])
+        if not c:
             continue
-        lines.append(f"## {label}")
-        for it in group:
+        allow = set(re.findall(r"[a-z']+", f"{i['outlet']} {T_BY_KEY[i['territory']][1]}".lower()))
+        allow |= {"caribbean", "kitts", "nevis", "saint", "federation", "information", "service"}
+        odd = unverified_terms(c["script"], f"{i['title']} {i['summary']} {i.get('article', '')}", allow)
+        if odd:
+            notes.append(f"CHECK '{c['headline']}': these names/terms are not in the source "
+                         f"article: {', '.join(odd)}.")
+
+    LEAD_IN = {
+        "stkitts": "We begin close to home, here in St. Kitts.",
+        "nevis": "Now to our sister island, Nevis.",
+    }
+    GROUP_LEAD = {
+        "neighbours": "Turning now to our neighbours around the region.",
+        "wider": "And now, news from across the wider Caribbean.",
+    }
+    intro = (f"Good morning, and welcome to the news on 2020 Vision Radio, one-oh-two point one FM. "
+             f"It is {tomorrow.strftime('%A, %B')} {tomorrow.day}. Here are the stories we are following.")
+    outro = ("That is the latest news from St. Kitts, Nevis and across the Caribbean. "
+             "Stay with us for the weather and sports.")
+    body_lines, total_words = [], word_count(intro) + word_count(outro)
+    groups_done, has_kitts = set(), any(i["territory"] == "stkitts" for i in selected)
+    for key, label, group, _m, _k, _q in TERRITORIES:
+        items = [i for i in selected if i["territory"] == key]
+        if not items:
+            continue
+        body_lines.append(f"## {label}")
+        if key == "stkitts":
+            lead = LEAD_IN["stkitts"]
+        elif key == "nevis":
+            lead = LEAD_IN["nevis"] if has_kitts else "We begin close to home, with news from Nevis."
+        elif group not in groups_done:
+            lead = GROUP_LEAD[group]
+        else:
+            lead = None
+        groups_done.add(group)
+        if lead:
+            body_lines.append(lead)
+            total_words += word_count(lead)
+        for it in items:
             c = copy.get(it["id"])
-            headline = (c or {}).get("headline") or it["title"]
             if c:
-                script = c["script"]
+                headline, script = c["headline"], c["script"]
             else:
-                script = (f"{it['outlet']} reports, {spoken_date(it['published'])}: {it['title']}. "
-                          f"{it['summary']}").strip()
-            lines += [f"# {headline}", script, source_line(it, link_ok)]
-    if not selected:
+                headline = it["title"].upper()
+                script = (f"{it['title']}. {it['summary']}").strip()
+            words = word_count(script)
+            total_words += words
+            body_lines += [f"# {headline}  (TRT {trt(words)})"] + script.split("\n") + [footnote_line(it, link_ok)]
+    lines = [f"=== SCRIPT 1: NEWS SEGMENT (approx. {trt(total_words)}) ===", "[station intro sting]",
+             intro, "[pause]"]
+    if selected:
+        lines += body_lines + [outro]
+    else:
         lines.append("No fresh, verifiable news items were found today. Please check the sources manually.")
         notes.append("NO news items passed the freshness/relevance filters. Run --check-feeds.")
-    lines += ["[transition sting]"]
+    lines += ["###", "[transition sting]"]
 
     # --- Weather & sports ---
     print("Generating weather and sports...")
@@ -887,14 +1099,17 @@ def main():
         notes.append(f"{len(report['failed'])} news feed(s) failed to load: {names}.")
     if bad_links:
         notes.append(f"{len(bad_links)} link(s) did not respond and are flagged in the script.")
-    notes.append(f"News items are from the last {NEWS_MAX_AGE_HOURS} hours. Google News links open "
-                 "the original article when clicked.")
+    notes.append(f"News items are from the last {NEWS_MAX_AGE_HOURS} hours. Footnote dates are "
+                 "the publication date of each source. Stories are written only from the article "
+                 "text; still click the source link to confirm anything important before airing.")
 
     # --- Build Word document ---
     doc = docx.Document()
     normal = doc.styles["Normal"]
     normal.font.name = "Arial"
     normal.font.size = Pt(13)  # larger text is easier to read on air
+    normal.paragraph_format.line_spacing = 1.5  # script-style spacing
+    normal.paragraph_format.space_after = Pt(6)
     for section in doc.sections:
         section.top_margin = section.bottom_margin = Inches(1)
         section.left_margin = section.right_margin = Inches(1)
