@@ -1,36 +1,53 @@
-name: Daily 2020 Vision Radio Script Automation
+name: Daily radio script
 
 on:
   schedule:
-    # Runs Sunday through Thursday at 3:50 PM AST (19:50 PM UTC)
-    # Bypasses peak top-of-the-hour queue delays to deliver by 4:00 PM AST
-    - cron: '50 19 * * 0-4'
-  workflow_dispatch: # Allows manual testing from the Actions tab
+    - cron: "0 22 * * *"      # 22:00 UTC = 6:00 PM St. Kitts time
+  workflow_dispatch:
+    inputs:
+      check_feeds:
+        description: "Only test the news feeds"
+        type: boolean
+        default: false
+
+permissions:
+  contents: write              # lets the job save seen_stories.json
 
 jobs:
-  build-and-send:
+  build-script:
     runs-on: ubuntu-latest
     steps:
-      - name: Checkout repository
-        uses: actions/checkout@v4
+      - uses: actions/checkout@v4
 
-      - name: Set up Python
-        uses: actions/setup-python@v5
+      - uses: actions/setup-python@v5
         with:
-          python-version: '3.11'
+          python-version: "3.12"
 
-      - name: Install dependencies
-        run: |
-          python -m pip install --upgrade pip
-          pip install google-genai python-docx openai anthropic feedparser
+      - name: Install packages
+        run: pip install feedparser python-docx requests google-genai openai anthropic
 
-      - name: Run Radio Automation Script
+      - name: Test feeds (manual run only)
+        if: ${{ github.event.inputs.check_feeds == 'true' }}
+        run: python radio_automation.py --check-feeds
+
+      - name: Generate and email script
+        if: ${{ github.event.inputs.check_feeds != 'true' }}
         env:
           GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
           OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
           ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
-          SKN_POLICE_FB_RSS: ${{ secrets.SKN_POLICE_FB_RSS }}
           SENDER_EMAIL: ${{ secrets.SENDER_EMAIL }}
           SENDER_PASSWORD: ${{ secrets.SENDER_PASSWORD }}
           PRESENTER_EMAIL: ${{ secrets.PRESENTER_EMAIL }}
+          SKN_POLICE_FB_RSS: ${{ secrets.SKN_POLICE_FB_RSS }}
+          NEVIS_NEWSCAST_RSS: ${{ secrets.NEVIS_NEWSCAST_RSS }}
+          TV_CARIBBEAN_RSS: ${{ secrets.TV_CARIBBEAN_RSS }}
         run: python radio_automation.py
+
+      - name: Save story history
+        if: ${{ github.event.inputs.check_feeds != 'true' }}
+        run: |
+          git config user.name "radio-bot"
+          git config user.email "radio-bot@users.noreply.github.com"
+          git add seen_stories.json
+          git diff --cached --quiet || (git commit -m "Update seen stories" && git push)
