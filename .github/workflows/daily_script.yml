@@ -6,7 +6,7 @@ on:
   workflow_dispatch:
     inputs:
       check_feeds:
-        description: "Only test the news feeds"
+        description: "Only test the news feeds (no script, no email)"
         type: boolean
         default: false
 
@@ -16,15 +16,18 @@ permissions:
 jobs:
   build-script:
     runs-on: ubuntu-latest
+    timeout-minutes: 30
     steps:
-      - uses: actions/checkout@v4
+      - name: Check out repository
+        uses: actions/checkout@v4
 
-      - uses: actions/setup-python@v5
+      - name: Set up Python
+        uses: actions/setup-python@v5
         with:
           python-version: "3.12"
 
       - name: Install packages
-        run: pip install feedparser python-docx requests google-genai openai anthropic
+        run: pip install feedparser python-docx requests google-genai openai anthropic trafilatura googlenewsdecoder
 
       - name: Test feeds (manual run only)
         if: ${{ github.event.inputs.check_feeds == 'true' }}
